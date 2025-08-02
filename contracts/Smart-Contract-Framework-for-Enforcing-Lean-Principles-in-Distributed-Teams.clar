@@ -6,11 +6,14 @@
 (define-constant err-invalid-vote (err u104))
 (define-constant err-proposal-closed (err u105))
 (define-constant err-insufficient-balance (err u106))
+(define-constant err-invalid-benchmark (err u107))
+(define-constant err-benchmark-not-active (err u108))
 
 (define-data-var next-task-id uint u1)
 (define-data-var next-waste-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var total-rewards-pool uint u0)
+(define-data-var next-benchmark-id uint u1)
 
 (define-map teams principal {
     name: (string-ascii 50),
@@ -70,6 +73,37 @@
     kaizen-proposals: uint,
     total-impact-score: uint,
     rewards-earned: uint
+})
+
+(define-map performance-benchmarks uint {
+    id: uint,
+    team: principal,
+    metric-name: (string-ascii 50),
+    target-value: uint,
+    measurement-unit: (string-ascii 20),
+    time-period: uint,
+    reward-multiplier: uint,
+    active: bool,
+    created-at: uint,
+    expires-at: uint
+})
+
+(define-map performance-records uint {
+    id: uint,
+    benchmark-id: uint,
+    team: principal,
+    actual-value: uint,
+    achievement-rate: uint,
+    recorded-at: uint,
+    verified: bool,
+    rewards-earned: uint
+})
+
+(define-map benchmark-achievements {team: principal, benchmark-id: uint} {
+    total-records: uint,
+    average-achievement: uint,
+    best-performance: uint,
+    last-updated: uint
 })
 
 (define-public (register-team (name (string-ascii 50)) (members (list 10 principal)))
@@ -344,4 +378,133 @@
 
 (define-read-only (get-total-rewards-pool)
     (var-get total-rewards-pool)
+)
+
+(define-public (create-performance-benchmark
+    (team principal)
+    (metric-name (string-ascii 50))
+    (target-value uint)
+    (measurement-unit (string-ascii 20))
+    (time-period uint)
+    (reward-multiplier uint)
+)
+    (let ((benchmark-id (var-get next-benchmark-id)))
+        (asserts! (is-some (map-get? teams team)) err-not-found)
+        (asserts! (is-team-leader tx-sender team) err-unauthorized)
+        (asserts! (> target-value u0) err-invalid-benchmark)
+        (asserts! (> reward-multiplier u0) err-invalid-benchmark)
+        (asserts! (> time-period u0) err-invalid-benchmark)
+        (map-set performance-benchmarks benchmark-id {
+            id: benchmark-id,
+            team: team,
+            metric-name: metric-name,
+            target-value: target-value,
+            measurement-unit: measurement-unit,
+            time-period: time-period,
+            reward-multiplier: reward-multiplier,
+            active: true,
+            created-at: stacks-block-height,
+            expires-at: (+ stacks-block-height time-period)
+        })
+        (var-set next-benchmark-id (+ benchmark-id u1))
+        (ok benchmark-id)
+    )
+)
+
+(define-public (record-performance
+    (benchmark-id uint)
+    (actual-value uint)
+)
+    (let ((benchmark (unwrap! (map-get? performance-benchmarks benchmark-id) err-not-found))
+          (record-id stacks-block-height))
+        (asserts! (get active benchmark) err-benchmark-not-active)
+        (asserts! (< stacks-block-height (get expires-at benchmark)) err-benchmark-not-active)
+        (asserts! (is-some (map-get? teams (get team benchmark))) err-not-found)
+        (let ((achievement-rate (calculate-achievement-rate (get target-value benchmark) actual-value))
+              (reward-amount (* achievement-rate (get reward-multiplier benchmark))))
+            (map-set performance-records record-id {
+                id: record-id,
+                benchmark-id: benchmark-id,
+                team: (get team benchmark),
+                actual-value: actual-value,
+                achievement-rate: achievement-rate,
+                recorded-at: stacks-block-height,
+                verified: false,
+                rewards-earned: u0
+            })
+            (unwrap-panic (update-benchmark-achievements (get team benchmark) benchmark-id achievement-rate actual-value))
+            (ok record-id)
+        )
+    )
+)
+
+(define-public (verify-performance-record (record-id uint))
+    (let ((record (unwrap! (map-get? performance-records record-id) err-not-found))
+          (benchmark (unwrap! (map-get? performance-benchmarks (get benchmark-id record)) err-not-found)))
+        (asserts! (is-team-leader tx-sender (get team record)) err-unauthorized)
+        (asserts! (not (get verified record)) err-already-exists)
+        (let ((reward-amount (* (get achievement-rate record) (get reward-multiplier benchmark))))
+            (map-set performance-records record-id (merge record {
+                verified: true,
+                rewards-earned: reward-amount
+            }))
+            (unwrap-panic (distribute-task-reward (get team record) reward-amount))
+            (ok true)
+        )
+    )
+)
+
+(define-public (deactivate-benchmark (benchmark-id uint))
+    (let ((benchmark (unwrap! (map-get? performance-benchmarks benchmark-id) err-not-found)))
+        (asserts! (is-team-leader tx-sender (get team benchmark)) err-unauthorized)
+        (map-set performance-benchmarks benchmark-id (merge benchmark {
+            active: false
+        }))
+        (ok true)
+    )
+)
+
+(define-private (calculate-achievement-rate (target-value uint) (actual-value uint))
+    (if (<= target-value actual-value)
+        (/ (* actual-value u100) target-value)
+        (/ (* target-value u100) actual-value)
+    )
+)
+
+(define-private (update-benchmark-achievements (team principal) (benchmark-id uint) (achievement-rate uint) (performance-value uint))
+    (let ((achievement-key {team: team, benchmark-id: benchmark-id})
+          (current-data (default-to {
+              total-records: u0,
+              average-achievement: u0,
+              best-performance: u0,
+              last-updated: u0
+          } (map-get? benchmark-achievements achievement-key))))
+        (let ((new-total (+ (get total-records current-data) u1))
+              (new-average (/ (+ (* (get average-achievement current-data) (get total-records current-data)) achievement-rate) new-total))
+              (new-best (if (> performance-value (get best-performance current-data)) performance-value (get best-performance current-data))))
+            (map-set benchmark-achievements achievement-key {
+                total-records: new-total,
+                average-achievement: new-average,
+                best-performance: new-best,
+                last-updated: stacks-block-height
+            })
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-benchmark (benchmark-id uint))
+    (map-get? performance-benchmarks benchmark-id)
+)
+
+(define-read-only (get-performance-record (record-id uint))
+    (map-get? performance-records record-id)
+)
+
+(define-read-only (get-team-benchmark-achievements (team principal) (benchmark-id uint))
+    (map-get? benchmark-achievements {team: team, benchmark-id: benchmark-id})
+)
+
+(define-read-only (get-active-benchmarks-for-team (team principal))
+    (ok "Use get-benchmark with sequential IDs to find active benchmarks")
 )
