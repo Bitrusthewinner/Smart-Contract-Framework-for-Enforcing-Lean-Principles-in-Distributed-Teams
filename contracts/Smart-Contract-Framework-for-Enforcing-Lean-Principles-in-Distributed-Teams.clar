@@ -8,12 +8,16 @@
 (define-constant err-insufficient-balance (err u106))
 (define-constant err-invalid-benchmark (err u107))
 (define-constant err-benchmark-not-active (err u108))
+(define-constant err-milestone-expired (err u109))
+(define-constant err-milestone-completed (err u110))
+(define-constant err-invalid-progress (err u111))
 
 (define-data-var next-task-id uint u1)
 (define-data-var next-waste-id uint u1)
 (define-data-var next-proposal-id uint u1)
 (define-data-var total-rewards-pool uint u0)
 (define-data-var next-benchmark-id uint u1)
+(define-data-var next-milestone-id uint u1)
 
 (define-map teams principal {
     name: (string-ascii 50),
@@ -104,6 +108,41 @@
     average-achievement: uint,
     best-performance: uint,
     last-updated: uint
+})
+
+(define-map project-milestones uint {
+    id: uint,
+    team: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 500),
+    deadline: uint,
+    base-reward: uint,
+    early-bonus-multiplier: uint,
+    late-penalty-multiplier: uint,
+    progress-percentage: uint,
+    status: (string-ascii 20),
+    created-at: uint,
+    completed-at: (optional uint),
+    final-reward: uint
+})
+
+(define-map milestone-progress-updates uint {
+    update-id: uint,
+    milestone-id: uint,
+    team: principal,
+    progress-percentage: uint,
+    update-note: (string-ascii 300),
+    updated-by: principal,
+    updated-at: uint
+})
+
+(define-map team-milestone-stats principal {
+    total-milestones: uint,
+    completed-on-time: uint,
+    completed-early: uint,
+    completed-late: uint,
+    total-rewards-earned: uint,
+    average-completion-time: uint
 })
 
 (define-public (register-team (name (string-ascii 50)) (members (list 10 principal)))
@@ -507,4 +546,202 @@
 
 (define-read-only (get-active-benchmarks-for-team (team principal))
     (ok "Use get-benchmark with sequential IDs to find active benchmarks")
+)
+
+(define-public (create-project-milestone
+    (team principal)
+    (title (string-ascii 100))
+    (description (string-ascii 500))
+    (deadline uint)
+    (base-reward uint)
+    (early-bonus-multiplier uint)
+    (late-penalty-multiplier uint)
+)
+    (let ((milestone-id (var-get next-milestone-id)))
+        (asserts! (is-some (map-get? teams team)) err-not-found)
+        (asserts! (is-team-leader tx-sender team) err-unauthorized)
+        (asserts! (> deadline stacks-block-height) err-milestone-expired)
+        (asserts! (> base-reward u0) err-invalid-progress)
+        (map-set project-milestones milestone-id {
+            id: milestone-id,
+            team: team,
+            title: title,
+            description: description,
+            deadline: deadline,
+            base-reward: base-reward,
+            early-bonus-multiplier: early-bonus-multiplier,
+            late-penalty-multiplier: late-penalty-multiplier,
+            progress-percentage: u0,
+            status: "active",
+            created-at: stacks-block-height,
+            completed-at: none,
+            final-reward: u0
+        })
+        (var-set next-milestone-id (+ milestone-id u1))
+        (unwrap-panic (initialize-team-milestone-stats team))
+        (ok milestone-id)
+    )
+)
+
+(define-public (update-milestone-progress
+    (milestone-id uint)
+    (progress-percentage uint)
+    (update-note (string-ascii 300))
+)
+    (let ((milestone (unwrap! (map-get? project-milestones milestone-id) err-not-found))
+          (update-id stacks-block-height))
+        (asserts! (is-eq (get status milestone) "active") err-milestone-completed)
+        (asserts! (<= progress-percentage u100) err-invalid-progress)
+        (asserts! (< stacks-block-height (get deadline milestone)) err-milestone-expired)
+        (map-set milestone-progress-updates update-id {
+            update-id: update-id,
+            milestone-id: milestone-id,
+            team: (get team milestone),
+            progress-percentage: progress-percentage,
+            update-note: update-note,
+            updated-by: tx-sender,
+            updated-at: stacks-block-height
+        })
+        (map-set project-milestones milestone-id (merge milestone {
+            progress-percentage: progress-percentage
+        }))
+        (ok update-id)
+    )
+)
+
+(define-public (complete-milestone (milestone-id uint))
+    (let ((milestone (unwrap! (map-get? project-milestones milestone-id) err-not-found)))
+        (asserts! (is-eq (get status milestone) "active") err-milestone-completed)
+        (asserts! (is-team-leader tx-sender (get team milestone)) err-unauthorized)
+        (let ((completion-time stacks-block-height)
+              (deadline (get deadline milestone))
+              (base-reward (get base-reward milestone))
+              (final-reward (calculate-milestone-reward milestone completion-time)))
+            (map-set project-milestones milestone-id (merge milestone {
+                status: "completed",
+                completed-at: (some completion-time),
+                progress-percentage: u100,
+                final-reward: final-reward
+            }))
+            (unwrap-panic (distribute-task-reward (get team milestone) final-reward))
+            (unwrap-panic (update-team-milestone-stats (get team milestone) milestone completion-time))
+            (ok final-reward)
+        )
+    )
+)
+
+(define-public (mark-milestone-at-risk (milestone-id uint))
+    (let ((milestone (unwrap! (map-get? project-milestones milestone-id) err-not-found)))
+        (asserts! (is-team-leader tx-sender (get team milestone)) err-unauthorized)
+        (asserts! (is-eq (get status milestone) "active") err-milestone-completed)
+        (map-set project-milestones milestone-id (merge milestone {
+            status: "at-risk"
+        }))
+        (ok true)
+    )
+)
+
+(define-private (calculate-milestone-reward (milestone {id: uint, team: principal, title: (string-ascii 100), description: (string-ascii 500), deadline: uint, base-reward: uint, early-bonus-multiplier: uint, late-penalty-multiplier: uint, progress-percentage: uint, status: (string-ascii 20), created-at: uint, completed-at: (optional uint), final-reward: uint}) (completion-time uint))
+    (let ((deadline (get deadline milestone))
+          (base-reward (get base-reward milestone)))
+        (if (< completion-time deadline)
+            (let ((days-early (- deadline completion-time))
+                  (bonus (* base-reward (get early-bonus-multiplier milestone))))
+                (+ base-reward (/ (* bonus days-early) u100))
+            )
+            (if (> completion-time deadline)
+                (let ((days-late (- completion-time deadline))
+                      (penalty (* base-reward (get late-penalty-multiplier milestone))))
+                    (if (> base-reward (/ (* penalty days-late) u100))
+                        (- base-reward (/ (* penalty days-late) u100))
+                        u1
+                    )
+                )
+                base-reward
+            )
+        )
+    )
+)
+
+(define-private (initialize-team-milestone-stats (team principal))
+    (begin
+        (if (is-none (map-get? team-milestone-stats team))
+            (map-set team-milestone-stats team {
+                total-milestones: u1,
+                completed-on-time: u0,
+                completed-early: u0,
+                completed-late: u0,
+                total-rewards-earned: u0,
+                average-completion-time: u0
+            })
+            (let ((current-stats (unwrap-panic (map-get? team-milestone-stats team))))
+                (map-set team-milestone-stats team (merge current-stats {
+                    total-milestones: (+ (get total-milestones current-stats) u1)
+                }))
+            )
+        )
+        (ok true)
+    )
+)
+
+(define-private (update-team-milestone-stats (team principal) (milestone {id: uint, team: principal, title: (string-ascii 100), description: (string-ascii 500), deadline: uint, base-reward: uint, early-bonus-multiplier: uint, late-penalty-multiplier: uint, progress-percentage: uint, status: (string-ascii 20), created-at: uint, completed-at: (optional uint), final-reward: uint}) (completion-time uint))
+    (let ((current-stats (default-to {
+            total-milestones: u0,
+            completed-on-time: u0,
+            completed-early: u0,
+            completed-late: u0,
+            total-rewards-earned: u0,
+            average-completion-time: u0
+        } (map-get? team-milestone-stats team)))
+          (deadline (get deadline milestone))
+          (final-reward (get final-reward milestone)))
+        (let ((new-stats 
+               (if (< completion-time deadline)
+                   (merge current-stats {
+                       completed-early: (+ (get completed-early current-stats) u1),
+                       total-rewards-earned: (+ (get total-rewards-earned current-stats) final-reward)
+                   })
+                   (if (> completion-time deadline)
+                       (merge current-stats {
+                           completed-late: (+ (get completed-late current-stats) u1),
+                           total-rewards-earned: (+ (get total-rewards-earned current-stats) final-reward)
+                       })
+                       (merge current-stats {
+                           completed-on-time: (+ (get completed-on-time current-stats) u1),
+                           total-rewards-earned: (+ (get total-rewards-earned current-stats) final-reward)
+                       })
+                   )
+               )))
+            (map-set team-milestone-stats team new-stats)
+            (ok true)
+        )
+    )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+    (map-get? project-milestones milestone-id)
+)
+
+(define-read-only (get-milestone-progress-update (update-id uint))
+    (map-get? milestone-progress-updates update-id)
+)
+
+(define-read-only (get-team-milestone-stats (team principal))
+    (map-get? team-milestone-stats team)
+)
+
+(define-read-only (assess-milestone-risk (milestone-id uint))
+    (match (map-get? project-milestones milestone-id)
+        milestone (let ((time-remaining (- (get deadline milestone) stacks-block-height))
+                        (progress (get progress-percentage milestone)))
+                    (if (and (< time-remaining u50) (< progress u75))
+                        "high-risk"
+                        (if (and (< time-remaining u100) (< progress u50))
+                            "medium-risk"
+                            "low-risk"
+                        )
+                    )
+                )
+        "milestone-not-found"
+    )
 )
