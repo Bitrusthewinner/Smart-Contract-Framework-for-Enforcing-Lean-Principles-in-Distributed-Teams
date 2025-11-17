@@ -1,0 +1,17 @@
+[project]
+name = "smart-contract-framework-for-enforcing-lean-principles-in-distributed-teams"
+version = "0.1.0"
+description = "A smart contract for enforcing lean principles in distributed teams"
+authors = ["AI Assistant"]
+homepage = ""
+license = "MIT"
+
+[contracts.smart-contract-framework-for-enforcing-lean-principles-in-distributed-teams]
+path = "contracts/Smart-Contract-Framework-for-Enforcing-Lean-Principles-in-Distributed-Teams.clar"
+depends_on = []
+
+[networks.testnet]
+deployer_account = "ST1PQHQKV0RJXZFY1DGX8MNSNYVE3VGZJSRTPGZGM"
+
+[networks.mainnet]
+deployer_account = "SP2J6ZY48GV1EZ5V2V5RB9MP66SW86PYKKNRV9EJ7"
