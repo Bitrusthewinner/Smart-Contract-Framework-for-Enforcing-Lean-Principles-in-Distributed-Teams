@@ -1,0 +1,6 @@
+[network]
+name = "simnet"
+stacks_node_rpc_address = "http://localhost:3999"
+
+[accounts.deployer]
+mnemonic = "sell invite acquire kitten bamboo drastic jelly vivid peace spawn twice guilt pave pen praise rubber stay arrow damage hold capable jacket sensible staff"

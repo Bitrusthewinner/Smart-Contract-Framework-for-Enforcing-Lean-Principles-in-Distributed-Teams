@@ -15,6 +15,7 @@
 })
 (define-map member-wip principal uint)
 (define-map task-feedback uint (list 10 { reviewer: principal, feedback: (string-ascii 512), rating: uint }))
+(define-map task-dependencies uint (list 10 uint))
 
 (define-public (register-member)
   (begin
@@ -32,7 +33,7 @@
   )
 )
 
-(define-public (create-task (title (string-ascii 256)) (description (string-ascii 1024)) (priority uint))
+(define-public (create-task (title (string-ascii 256)) (description (string-ascii 1024)) (priority uint) (dependencies (list 10 uint)))
   (let ((task-id (var-get next-task-id)))
     (begin
       (asserts! (is-some (map-get? team-members tx-sender)) (err u102))
@@ -46,6 +47,7 @@
         created-at: block-height,
         updated-at: block-height
       })
+      (map-set task-dependencies task-id dependencies)
       (var-set next-task-id (+ task-id u1))
       (ok task-id)
     )
@@ -66,13 +68,22 @@
   )
 )
 
+(define-private (are-dependencies-completed (deps (list 10 uint)))
+  (is-eq (len (filter (lambda (dep-id) (let ((dep-task (unwrap-panic (map-get? tasks dep-id)))) (not (is-eq (get status dep-task) u2)))) deps)) u0)
+)
+
 (define-public (update-task-status (task-id uint) (new-status uint))
   (let ((task (unwrap! (map-get? tasks task-id) (err u107)))
         (assignee (unwrap! (get assignee task) (err u108)))
-        (current-wip (default-to u0 (map-get? member-wip assignee))))
+        (current-wip (default-to u0 (map-get? member-wip assignee)))
+        (deps (default-to (list) (map-get? task-dependencies task-id))))
     (begin
       (asserts! (is-eq assignee tx-sender) (err u109))
       (asserts! (< new-status u3) (err u110))
+      (if (is-eq new-status u1)
+        (asserts! (are-dependencies-completed deps) (err u117))
+        true
+      )
       (map-set tasks task-id (merge task { status: new-status, updated-at: block-height }))
       (if (is-eq new-status u2)
         (map-set member-wip assignee (- current-wip u1))
@@ -126,4 +137,8 @@
 
 (define-read-only (get-task-feedback (task-id uint))
   (map-get? task-feedback task-id)
+)
+
+(define-read-only (get-task-dependencies (task-id uint))
+  (map-get? task-dependencies task-id)
 )
